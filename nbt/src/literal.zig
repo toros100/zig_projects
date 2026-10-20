@@ -29,7 +29,7 @@ pub fn primitivePayloadBytes(comptime T: type, comptime val: T) []const u8 {
     return comptime blk: {
         switch (T) {
             i8, i16, i32, i64, f32, f64 => {
-                const I = std.meta.Int(.unsigned, @bitSizeOf(T));
+                const I = @Int(.unsigned, @bitSizeOf(T));
                 const as_int: I = @bitCast(val);
                 break :blk &std.mem.toBytes(std.mem.nativeToBig(I, as_int));
             },

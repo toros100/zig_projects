@@ -3,6 +3,8 @@ const nbt = @import("nbt.zig");
 const meta = @import("meta.zig");
 const lit = @import("literal.zig");
 
+const safety = @import("builtin").mode.runtimeSafety();
+
 pub const ParseError = error{
     UnexpectedEof,
     UnexpectedTag,
@@ -19,21 +21,19 @@ test "PayloadReader interface" {
     // methods that should exist on every implementation of PayloadReader (builtin)
     inline for (comptime std.enums.values(nbt.Tag)) |t| {
         if (t != .end) {
-            const reader = &PayloadReader(t);
+            const reader = PayloadReader(t);
 
-            const init_fn_ty = fn (*PayloadReader(t), []const u8) ParseError!void;
+            const init_fn_ty = fn ([]const u8) ParseError!PayloadReader(t);
 
             const finish_fn_ty = fn (*PayloadReader(t)) ParseError!usize;
 
-            // initializes the reader with data
-            // may not read any of its own fields before writing to them, may not assume that fields
-            // have their default value (restore defaults on init)
-            if (!(init_fn_ty == @TypeOf(reader.init))) @compileError(@typeName(reader.*) ++
+            // initializes a reader with data
+            if (!(init_fn_ty == @TypeOf(reader.init))) @compileError(@typeName(reader) ++
                 " should have method `init` with type " ++ @typeName(init_fn_ty));
 
             // tries to consume the entire payload, returns the total number of bytes read
             // (trivial for anything other than list or compound tags)
-            if (!(finish_fn_ty == @TypeOf(reader.finish))) @compileError(@typeName(reader.*) ++
+            if (!(finish_fn_ty == @TypeOf(reader.finish))) @compileError(@typeName(reader) ++
                 " should have method `finish` with type " ++ @typeName(finish_fn_ty));
         }
     }
@@ -85,25 +85,22 @@ fn NumberReader(T: type) type {
         const byte_width: usize = @divExact(@bitSizeOf(T), 8);
         const I = switch (T) {
             i8, i16, i32, i64 => T,
-            f32, f64 => std.meta.Int(.unsigned, @bitSizeOf(T)),
+            f32, f64 => @Int(.unsigned, @bitSizeOf(T)),
             else => @compileError("unexpected type: " ++ @typeName(T)),
         };
 
-        src: *const [Self.byte_width]u8 = undefined,
+        value: T,
 
-        fn init(self: *Self, src: []const u8) ParseError!void {
+        fn init(src: []const u8) ParseError!Self {
             if (src.len < Self.byte_width) {
                 return error.UnexpectedEof;
             }
-            self.src = src[0..Self.byte_width];
+            const bs = src[0..Self.byte_width];
+            return .{ .value = @bitCast(std.mem.readInt(I, bs, .big)) };
         }
 
         fn finish(_: *Self) ParseError!usize {
             return Self.byte_width;
-        }
-
-        pub fn get(self: Self) T {
-            return @bitCast(std.mem.readInt(I, self.src, .big));
         }
     };
 }
@@ -113,9 +110,8 @@ test "NumberReader" {
 
     inline for (ts) |T| {
         const v = @as(T, 7);
-        var r: NumberReader(T) = .{};
-        try r.init(lit.primitivePayloadBytes(T, v));
-        try std.testing.expectEqual(v, r.get());
+        var r: NumberReader(T) = try .init(lit.primitivePayloadBytes(T, v));
+        try std.testing.expectEqual(v, r.value);
         try std.testing.expectEqual(@divExact(@bitSizeOf(T), 8), try r.finish());
     }
 }
@@ -130,20 +126,22 @@ fn ArrayReader(comptime T: type) type {
         const Self = @This();
         const byte_width: usize = @divExact(@bitSizeOf(T), 8);
 
-        src: []const u8 = undefined,
+        src: []const u8,
 
-        /// length of the array (in terms of its element type, not bytes)
-        len: usize = 0,
+        /// length of the array (in terms of elements, not bytes)
+        len: usize,
 
-        fn init(self: *Self, src: []const u8) ParseError!void {
+        fn init(src: []const u8) ParseError!Self {
             const length = try readI32Length(src);
 
             if (src.len < 4 + byte_width * length) {
                 return error.UnexpectedEof;
             }
 
-            self.src = src[4 .. 4 + byte_width * length];
-            self.len = length;
+            return .{
+                .src = src[4 .. 4 + byte_width * length],
+                .len = length,
+            };
         }
 
         fn finish(self: *Self) ParseError!usize {
@@ -160,7 +158,7 @@ fn ArrayReader(comptime T: type) type {
         }
 
         /// returns the raw bytes of the array, NOT including the 4 byte length prefix
-        pub fn raw_bytes(self: Self) []const u8 {
+        pub fn rawBytes(self: Self) []const u8 {
             return self.src;
         }
     };
@@ -181,20 +179,17 @@ test "ArrayReader" {
 
     try t.expectEqual(4 + len * 1, byte_array_data.len);
 
-    var ba_reader = ArrayReader(i8){};
-    try ba_reader.init(byte_array_data);
-    var ia_reader = ArrayReader(i32){};
-    try ia_reader.init(int_array_data);
-    var la_reader = ArrayReader(i64){};
-    try la_reader.init(long_array_data);
+    var ba_reader = try ArrayReader(i8).init(byte_array_data);
+    var ia_reader = try ArrayReader(i32).init(int_array_data);
+    var la_reader = try ArrayReader(i64).init(long_array_data);
 
     try t.expectEqual(len, ba_reader.len);
     try t.expectEqual(len, ia_reader.len);
     try t.expectEqual(len, la_reader.len);
 
-    try t.expectEqualSlices(u8, byte_array_data[4..], ba_reader.raw_bytes());
-    try t.expectEqualSlices(u8, int_array_data[4..], ia_reader.raw_bytes());
-    try t.expectEqualSlices(u8, long_array_data[4..], la_reader.raw_bytes());
+    try t.expectEqualSlices(u8, byte_array_data[4..], ba_reader.rawBytes());
+    try t.expectEqualSlices(u8, int_array_data[4..], ia_reader.rawBytes());
+    try t.expectEqualSlices(u8, long_array_data[4..], la_reader.rawBytes());
 
     for (0..len) |i| {
         try t.expectEqual(@as(i8, @intCast(i)), ba_reader.getIth(i));
@@ -206,19 +201,15 @@ test "ArrayReader" {
 pub const StringReader = struct {
     const Self = @This();
 
-    str: []const u8 = undefined,
+    value: []const u8,
 
-    fn init(self: *Self, src: []const u8) ParseError!void {
+    fn init(src: []const u8) ParseError!Self {
         const res, _ = try readNbtString(src);
-        self.str = res;
+        return .{ .value = res };
     }
 
     fn finish(self: *Self) ParseError!usize {
-        return self.str.len + 2;
-    }
-
-    pub fn get(self: Self) []const u8 {
-        return self.str;
+        return self.value.len + 2;
     }
 };
 
@@ -244,25 +235,25 @@ fn payloadByteSizeLB(tag: nbt.Tag) usize {
 pub const ListReader = struct {
     const Self = @This();
 
-    src: []const u8 = undefined,
-    off: usize = 0,
-    remaining: usize = 0,
-    elements_tag: nbt.Tag = undefined,
-    elements_taken: bool = false,
+    src: []const u8,
+    off: usize,
+    remaining: usize,
+    elements_tag: nbt.Tag,
     element_pending: bool = false,
 
-    len: usize = 0,
+    elements_taken: if (safety) bool else void = if (safety) false else {},
 
-    fn init(self: *Self, src: []const u8) ParseError!void {
+    len: usize,
+
+    fn init(src: []const u8) ParseError!Self {
         const t = try readTag(src);
-        self.off = 1;
-        const length = try readI32Length(src[self.off..]);
-        self.off += 4;
+        const length = try readI32Length(src[1..]);
+        const off: usize = 5;
 
         if (t == .end and length > 0) return error.InvalidList;
 
         // cheap sanity check, could prevent absurdly large allocations for bad data in implList
-        if (src.len - self.off < length *| payloadByteSizeLB(t)) return error.UnexpectedEof;
+        if (src.len - off < length *| payloadByteSizeLB(t)) return error.UnexpectedEof;
         // saturating mul is actually important, for example if the length is 2^31 - 1, the LB is >= 2
         // and it is running on a 32 bit platform
         //
@@ -271,25 +262,29 @@ pub const ListReader = struct {
         // pathological case and implList is the only place where my "derived" impl will actually
         // allocate, based on the len reported by ListReader)
 
-        self.elements_tag = t;
-        self.remaining = length;
-        self.len = length;
-        self.src = src;
-        self.elements_taken = false;
-        self.element_pending = false;
+        return .{
+            .off = off,
+            .elements_tag = t,
+            .remaining = length,
+            .len = length,
+            .src = src,
+        };
     }
 
     /// returns a struct that can be used to read the elements of the list
     /// may only be called once
     pub fn elements(self: *Self) ElementsReader {
-        meta.assertFmt(!self.elements_taken, "ListReader.elements called more than once", .{});
-        self.elements_taken = true;
+        if (safety) {
+            meta.assertFmt(!self.elements_taken, "ListReader.elements called more than once", .{});
+            self.elements_taken = true;
+        }
+
         return switch (self.elements_tag) {
             .end => ElementsReader.end,
             inline else => |t| @unionInit(
                 ElementsReader,
                 @tagName(t),
-                .{ .list = self },
+                .{ .parent = self },
             ),
         };
     }
@@ -354,27 +349,30 @@ fn ElementsOf(comptime tag: nbt.Tag) type {
     return struct {
         const Self = @This();
 
-        list: *ListReader,
-        reader: PayloadReader(tag) = undefined,
-        reader_active: bool = false,
+        parent: *ListReader,
+        reader: ?PayloadReader(tag) = null,
         err: ?ParseError = null,
 
+        /// returns the next elements payload reader, if any. the pointer is valid (at most) until
+        /// the next call of next.
         pub fn next(self: *Self) ParseError!?*PayloadReader(tag) {
             if (self.err) |e| {
                 return e;
             }
-            if (self.reader_active) {
-                const n = try self.reader.finish();
-                self.list.finishElement(n);
-                self.reader_active = false;
-            }
-            if (self.list.nextElementData()) |s| {
-                self.reader.init(s) catch |e| {
+            if (self.reader) |*r| {
+                const n = r.finish() catch |e| {
                     self.err = e;
                     return e;
                 };
-                self.reader_active = true;
-                return &self.reader;
+                self.parent.finishElement(n);
+                self.reader = null;
+            }
+            if (self.parent.nextElementData()) |s| {
+                self.reader = PayloadReader(tag).init(s) catch |e| {
+                    self.err = e;
+                    return e;
+                };
+                return &self.reader.?;
             } else {
                 return null;
             }
@@ -402,8 +400,7 @@ test "ListReader" {
         input_data = input_data ++ lit.toNbtString(i);
     }
 
-    var lr = ListReader{};
-    try lr.init(input_data);
+    var lr = try ListReader.init(input_data);
 
     var strings = switch (lr.elements()) {
         .string => |s| s,
@@ -413,7 +410,7 @@ test "ListReader" {
     var idx: usize = 0;
     while (try strings.next()) |s| {
         try t.expect(idx < len);
-        try t.expectEqualStrings(inputs[idx], s.get());
+        try t.expectEqualStrings(inputs[idx], s.value);
         idx += 1;
     }
     try t.expectEqual(len, idx);
@@ -427,19 +424,15 @@ const ChildData = struct {
 
 pub const CompoundReader = struct {
     const Self = @This();
-    src: []const u8 = undefined,
+    src: []const u8,
     reached_end: bool = false,
     off: usize = 0,
     pending_child_off: usize = 0,
     err: ?ParseError = null,
 
-    fn init(self: *Self, src: []const u8) ParseError!void {
+    fn init(src: []const u8) ParseError!Self {
         if (src.len == 0) return error.UnexpectedEof;
-        self.off = 0;
-        self.err = null;
-        self.src = src;
-        self.reached_end = false;
-        self.pending_child_off = 0;
+        return .{ .src = src };
     }
 
     fn finish(self: *Self) ParseError!usize {
@@ -477,7 +470,7 @@ pub const CompoundReader = struct {
         };
     }
 
-    // will never return Tag.end
+    // will never return ChildData with tag == .end
     fn nextChildData(self: *Self) ParseError!?ChildData {
         if (self.err) |e| return e;
         if (self.reached_end) return null;
@@ -532,33 +525,31 @@ test "CompoundReader" {
 
     const data = lit.encodeCompoundPayload(SomeStruct, val);
 
-    try t.expectEqual(nbt.Tag.end.into_u8(), data[data.len - 1]);
+    try t.expectEqual(nbt.Tag.end.intoU8(), data[data.len - 1]);
 
-    var reader = CompoundReader{};
-
-    try reader.init(data);
+    var reader = try CompoundReader.init(data);
 
     var children = reader.children();
 
     const first_ch = try children.next() orelse return error.MissingChild;
     try t.expectEqualStrings("x", first_ch.name);
-    try t.expectEqual(7, first_ch.reader.int.get());
+    try t.expectEqual(7, (try first_ch.reader().as(.int)).value);
 
     const second_ch = try children.next() orelse return error.MissingChild;
     try t.expectEqualStrings("name", second_ch.name);
-    try t.expectEqualStrings("wow", first_ch.reader.string.get());
+    try t.expectEqualStrings("wow", (try second_ch.reader().as(.string)).value);
 
     const third_ch = try children.next() orelse return error.MissingChild;
     try t.expectEqualStrings("cool", third_ch.name);
-    try t.expectEqual(-1, first_ch.reader.byte.get());
+    try t.expectEqual(-1, (try third_ch.reader().as(.byte)).value);
 
     const fourth_ch = try children.next() orelse return error.MissingChild;
     try t.expectEqualStrings("inner", fourth_ch.name);
-    var inner_children = fourth_ch.reader.compound.children();
+    var inner_children = (try fourth_ch.reader().as(.compound)).children();
 
     const first_inner_ch = try inner_children.next() orelse return error.MissingChild;
     try t.expectEqualStrings("a", first_inner_ch.name);
-    try t.expectEqual(100, first_inner_ch.reader.int.get());
+    try t.expectEqual(100, (try first_inner_ch.reader().as(.int)).value);
 
     if (try children.next()) |_| {
         return error.ExtraChild;
@@ -566,19 +557,29 @@ test "CompoundReader" {
 }
 
 pub const Child = struct {
+    const Self = @This();
     name: []const u8,
-    reader: *AnyPayloadReader,
+    parent: *ChildReader,
+    gen: if (safety) usize else void,
+
+    pub fn reader(self: Self) *AnyPayloadReader {
+        if (safety) {
+            meta.assertFmt(self.gen == self.parent.gen, "stale Child accessed", .{});
+        }
+        return &self.parent.reader.?;
+    }
 };
 
 pub const ChildReader = struct {
     const Self = @This();
     parent: *CompoundReader,
-    reader: AnyPayloadReader = undefined,
-    reader_active: bool = false,
+    reader: ?AnyPayloadReader = null,
     err: ?ParseError = null,
 
+    gen: if (safety) usize else void = if (safety) 0 else {},
+
     /// gets the next child tag, if any
-    /// WARN: the reader contained in Child is only valid until the next call of next
+    /// the Child is only valid until the next call of next
     pub fn next(self: *Self) ParseError!?Child {
         if (self.err) |e| return e;
         return self.nextInner() catch |e| {
@@ -588,50 +589,45 @@ pub const ChildReader = struct {
     }
 
     fn nextInner(self: *Self) ParseError!?Child {
-        if (self.reader_active) {
-            const n = switch (self.reader) {
-                .end => meta.unreachableFmt("self.reader on ChildReader was Tag.end variant", .{}),
-                inline else => |*r| try r.finish(),
+        if (self.reader) |*r| {
+            const n = switch (r.*) {
+                .end => meta.unreachableFmt(
+                    "internal error: self.reader on ChildReader was Tag.end variant",
+                    .{},
+                ),
+                inline else => |*x| try x.finish(),
             };
-
             self.parent.finishChild(n);
-            self.reader_active = false;
+            self.reader = null;
         }
 
         const c = try self.parent.nextChildData() orelse return null;
 
         switch (c.tag) {
-            .end => meta.unreachableFmt("CompoundReader.nextChildData returned Tag.end variant", .{}),
+            .end => meta.unreachableFmt(
+                "internal error: CompoundReader.nextChildData returned Tag.end variant",
+                .{},
+            ),
             inline else => |t| {
-                self.reader = @unionInit(AnyPayloadReader, @tagName(t), undefined);
-                try @field(self.reader, @tagName(t)).init(c.data);
-                self.reader_active = true;
-                return .{ .name = c.name, .reader = &self.reader };
+                self.reader = @unionInit(
+                    AnyPayloadReader,
+                    @tagName(t),
+                    try PayloadReader(t).init(c.data),
+                );
+
+                if (safety) {
+                    self.gen +%= 1;
+                }
+
+                return Child{
+                    .name = c.name,
+                    .parent = self,
+                    .gen = self.gen,
+                };
             },
         }
     }
 };
-
-fn tagFor(comptime T: type, comptime Impl: type) ?nbt.Tag {
-    if (meta.getFn(Impl, "parsePayloadInto")) |f| {
-        inline for (comptime std.enums.values(nbt.Tag)) |tg| {
-            if (tg != .end and @TypeOf(f) == fn (*T, *PayloadReader(tg), std.mem.Allocator) ParseError!void) {
-                return tg;
-            }
-        }
-        @compileError("CUM" ++ @typeName(@TypeOf(f)));
-    }
-
-    return switch (T) {
-        i8 => .byte,
-        i16 => .short,
-        i32 => .int,
-        i64 => .long,
-        f32 => .float,
-        f64 => .double,
-        else => null,
-    };
-}
 
 /// used to generate a method parsePayloadInto on a struct
 /// cf. chunk_test.zig for usage
@@ -837,13 +833,15 @@ const FieldInfo = struct {
 fn deriveStructImpl(comptime T: type) meta.ComptimeResult(ParseImpl) {
     const info = @typeInfo(T);
 
-    if (info != .@"struct" or (info == .@"struct" and info.@"struct".is_tuple))
+    if (info != .@"struct" or info.@"struct".is_tuple)
         return .initErr(std.fmt.comptimePrint(
             "unsupported type {s}, should be a non-tuple struct",
             .{@typeName(T)},
         ));
 
-    const FieldEnum = std.meta.FieldEnum(T);
+    const struct_info = info.@"struct";
+
+    const FieldEnumT = std.meta.FieldEnum(T);
 
     // checking for declared field name overrides, otherwise taking default names
     // (which are just the zig struct names)
@@ -851,11 +849,11 @@ fn deriveStructImpl(comptime T: type) meta.ComptimeResult(ParseImpl) {
     _ = comptime field_names;
 
     comptime var field_impls_var = std.EnumArray(
-        FieldEnum,
+        FieldEnumT,
         ParseImpl,
     ).initUndefined();
 
-    for (std.enums.values(FieldEnum)) |f| {
+    for (std.enums.values(FieldEnumT)) |f| {
         const r = resolveImpl(@FieldType(T, @tagName(f)));
         switch (r) {
             .ok => |rr| field_impls_var.set(f, rr),
@@ -873,14 +871,14 @@ fn deriveStructImpl(comptime T: type) meta.ComptimeResult(ParseImpl) {
                 alloc: std.mem.Allocator,
             ) ParseError!void {
                 var result: T = undefined;
-                var seen = std.EnumSet(FieldEnum).initEmpty();
+                var seen = std.EnumSet(FieldEnumT).empty;
 
                 var children = reader.children();
 
                 while (try children.next()) |c| {
                     const field = field_names.stringToFieldEnum(c.name) orelse continue;
 
-                    if (@typeInfo(FieldEnum).@"enum".fields.len > 0) {
+                    if (@typeInfo(FieldEnumT).@"enum".field_names.len > 0) {
                         // guarding against `error: unreachable else prong; all cases already handled`
                         // cf test "deriveParsePayloadInto with no fields"
                         switch (field) {
@@ -889,7 +887,7 @@ fn deriveStructImpl(comptime T: type) meta.ComptimeResult(ParseImpl) {
 
                                 if (seen.contains(field)) return error.DuplicateField;
 
-                                const field_reader = try c.reader.as(FieldImpl.tag);
+                                const field_reader = try c.reader().as(FieldImpl.tag);
 
                                 try FieldImpl.ty.parsePayloadInto(
                                     &@field(result, @tagName(f)),
@@ -903,11 +901,10 @@ fn deriveStructImpl(comptime T: type) meta.ComptimeResult(ParseImpl) {
                     }
                 }
 
-                inline for (comptime std.enums.values(FieldEnum)) |f| {
-                    if (!seen.contains(f)) {
-                        const fi = std.meta.fieldInfo(T, f);
-                        if (fi.defaultValue()) |d| {
-                            @field(result, @tagName(f)) = d;
+                inline for (struct_info.field_names, struct_info.field_types, struct_info.field_attrs) |name, Ty, attrs| {
+                    if (!seen.contains(@field(FieldEnumT, name))) {
+                        if (attrs.defaultValue(Ty)) |dv| {
+                            @field(result, name) = dv;
                         } else {
                             return error.MissingField;
                         }
@@ -1009,53 +1006,31 @@ const ParseImpl = struct {
 pub fn resolveImpl(comptime T: type) meta.ComptimeResult(ParseImpl) {
     if (meta.isContainer(T)) return requireImpl(T);
 
-    switch (T) {
-        i8, i16, i32, i64, f32, f64, []const u8 => return implPrimitive(T),
-        else => {
-            const info = @typeInfo(T);
-            if (info == .pointer and info.pointer.size == .slice) {
-                return implList(T);
-            }
-        },
+    if (nbt.asPrimitive(T)) |tag| {
+        return .initOk(.{
+            .ty = struct {
+                pub fn parsePayloadInto(
+                    dst: *T,
+                    reader: *PayloadReader(tag),
+                    _: std.mem.Allocator,
+                ) ParseError!void {
+                    // works uniformly for all primitives right now
+                    dst.* = reader.value;
+                }
+            },
+            .tag = tag,
+        });
     }
+
+    const info = @typeInfo(T);
+    if (info == .pointer and info.pointer.size == .slice) return implList(T);
+
     return .initErr("unsupported type: " ++ @typeName(T));
-}
-
-fn implPrimitive(comptime T: type) meta.ComptimeResult(ParseImpl) {
-    switch (T) {
-        i8, i16, i32, i64, f32, f64, []const u8 => |Ty| {
-            const tag: nbt.Tag = switch (Ty) {
-                i8 => .byte,
-                i16 => .short,
-                i32 => .int,
-                i64 => .long,
-                f32 => .float,
-                f64 => .double,
-                []const u8 => .string,
-                else => @compileError("internal error: " ++ @typeName(T) ++ " is not a primitive"),
-            };
-
-            return .initOk(.{
-                .ty = struct {
-                    pub fn parsePayloadInto(
-                        dst: *T,
-                        reader: *PayloadReader(tag),
-                        _: std.mem.Allocator,
-                    ) ParseError!void {
-                        // works uniformly for all primitives right now
-                        dst.* = reader.get();
-                    }
-                },
-                .tag = tag,
-            });
-        },
-        else => @compileError("internal error: " ++ @typeName(T) ++ " is not a primitive"),
-    }
 }
 
 fn implList(comptime T: type) meta.ComptimeResult(ParseImpl) {
     const info = @typeInfo(T);
-    if ((info != .pointer) or (info == .pointer and info.pointer.size != .slice))
+    if (info != .pointer or info.pointer.size != .slice)
         @compileError("internal error: " ++ @typeName(T) ++ " is not a slice type");
     return .initOk(.{
         .ty = struct {
@@ -1063,7 +1038,11 @@ fn implList(comptime T: type) meta.ComptimeResult(ParseImpl) {
             pub fn parsePayloadInto(dst: *T, reader: *PayloadReader(.list), allocator: std.mem.Allocator) ParseError!void {
                 const el = reader.elements();
 
-                if (el == .end) return; // list must be empty
+                if (el == .end) {
+                    // list must be empty
+                    dst.* = &.{};
+                    return;
+                }
 
                 var elems = try el.as(ElemImpl.tag);
 
@@ -1081,13 +1060,12 @@ fn implList(comptime T: type) meta.ComptimeResult(ParseImpl) {
     });
 }
 
-pub fn parseLeaky(comptime T: type, alloc: std.mem.Allocator, src: []const u8) !struct {
+pub fn parseLeaky(comptime T: type, arena: std.mem.Allocator, src: []const u8) !struct {
     name: []const u8,
     val: T,
     bytes_read: usize,
 } {
-    const t = comptime tagFor(T, T) orelse @compileError(@typeName(T) ++
-        " does not have required stuff");
+    const t = requireImpl(T).unwrap().tag;
 
     if (try readTag(src) != t) return error.UnexpectedTag;
 
@@ -1095,13 +1073,11 @@ pub fn parseLeaky(comptime T: type, alloc: std.mem.Allocator, src: []const u8) !
     const name, const n = try readNbtString(src[off..]);
     off += n;
 
-    var reader = PayloadReader(t){};
-
-    try reader.init(src[off..]);
+    var reader = try PayloadReader(t).init(src[off..]);
 
     var val: T = undefined;
 
-    try val.parsePayloadInto(&reader, alloc);
+    try val.parsePayloadInto(&reader, arena);
 
     off += try reader.finish();
 
@@ -1122,8 +1098,8 @@ test "parseLeaky" {
         pub fn parsePayloadInto(self: *@This(), reader: *PayloadReader(.compound), _: std.mem.Allocator) ParseError!void {
             var children = reader.children();
             while (try children.next()) |c| {
-                if (std.mem.eql(u8, c.name, "x")) self.x = (try c.reader.as(.byte)).get();
-                if (std.mem.eql(u8, c.name, "name")) self.name = (try c.reader.as(.string)).get();
+                if (std.mem.eql(u8, c.name, "x")) self.x = (try c.reader().as(.byte)).value;
+                if (std.mem.eql(u8, c.name, "name")) self.name = (try c.reader().as(.string)).value;
             }
         }
     };
@@ -1156,7 +1132,7 @@ pub fn readNbtString(src: []const u8) ParseError!struct { []const u8, usize } {
         return error.UnexpectedEof;
     }
 
-    const len = @as(usize, std.mem.readInt(u16, src[0..2], std.builtin.Endian.big));
+    const len = @as(usize, std.mem.readInt(u16, src[0..2], .big));
 
     return if (src.len < 2 + len) error.UnexpectedEof else .{ src[2 .. 2 + len], 2 + len };
 }
@@ -1193,7 +1169,7 @@ fn skipString(src: []const u8) ParseError!usize {
     if (src.len < 2) {
         return error.UnexpectedEof;
     }
-    const len = @as(usize, std.mem.readInt(u16, src[0..2], std.builtin.Endian.big));
+    const len = @as(usize, std.mem.readInt(u16, src[0..2], .big));
     return skipN(2 + len, src);
 }
 

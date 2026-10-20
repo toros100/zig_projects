@@ -25,20 +25,20 @@ pub const Tag = enum(u8) {
     int_array = 11,
     long_array = 12,
 
-    pub inline fn bytes(self: Self) [1]u8 {
-        return .{@intFromEnum(self)};
+    pub fn bytes(self: Self) [1]u8 {
+        return .{@backingInt(self)};
     }
 
-    pub inline fn into_u8(self: Self) u8 {
-        return @intFromEnum(self);
+    pub fn intoU8(self: Self) u8 {
+        return @backingInt(self);
     }
 
     pub fn fromByte(b: u8) error{InvalidTag}!Self {
-        return if (b > @intFromEnum(Tag.long_array)) error.InvalidTag else @enumFromInt(b);
+        return if (b > @backingInt(Tag.long_array)) error.InvalidTag else @fromBackingInt(@intCast(b));
     }
 };
 
-pub inline fn asNumericPrimitive(comptime T: type) ?Tag {
+pub fn asNumericPrimitive(comptime T: type) ?Tag {
     return switch (T) {
         i8 => .byte,
         i16 => .short,
@@ -50,7 +50,7 @@ pub inline fn asNumericPrimitive(comptime T: type) ?Tag {
     };
 }
 
-pub inline fn asPrimitive(comptime T: type) ?Tag {
+pub fn asPrimitive(comptime T: type) ?Tag {
     if (comptime asNumericPrimitive(T)) |tg| {
         return tg;
     } else if (T == []const u8) {
@@ -60,8 +60,10 @@ pub inline fn asPrimitive(comptime T: type) ?Tag {
     }
 }
 
-// type that can be used to handle list tags without allocating, if there is a comptime known
+// type that can be used to handle list tags without allocating*, if there is a comptime known
 // upper bound on the length
+//
+// *: without allocating for the list itself, the elements can still allocate
 pub fn BoundedList(comptime T: type, comptime cap: usize) type {
     const TImpl = parse.resolveImpl(T).unwrap();
 
@@ -76,12 +78,22 @@ pub fn BoundedList(comptime T: type, comptime cap: usize) type {
             reader: *PayloadReader(.list),
             alloc: std.mem.Allocator,
         ) ParseError!void {
+            if (reader.elements_tag == .end) {
+                // should be excluded at this point
+                meta.assertFmt(
+                    reader.len == 0,
+                    "internal error: list with element tag .end has length > 0",
+                    .{},
+                );
+                self.len = 0;
+                return;
+            }
+
             var elems = try reader.elements().as(TImpl.tag);
 
             if (reader.len > cap) {
                 return error.InvalidValue;
             }
-
             self.len = reader.len;
 
             var i: usize = 0;
@@ -121,14 +133,14 @@ fn Array(comptime tag: Tag) type {
         pub const empty = Self{};
 
         len: usize = 0,
-        raw_bytes: []const u8 = undefined,
+        raw_bytes: []const u8 = &.{},
 
         pub fn parsePayloadInto(
             self: *Self,
             reader: *PayloadReader(tag),
             _: std.mem.Allocator,
         ) ParseError!void {
-            self.raw_bytes = reader.raw_bytes();
+            self.raw_bytes = reader.rawBytes();
             self.len = reader.len;
         }
 
@@ -165,3 +177,11 @@ pub const Heightmap = struct {
         return @truncate(u >> shift);
     }
 };
+
+test {
+    _ = @import("parse.zig");
+    _ = @import("literal.zig");
+    _ = @import("meta.zig");
+    _ = @import("loader.zig");
+    _ = @import("chunk_test.zig");
+}

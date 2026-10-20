@@ -86,9 +86,10 @@ pub const Loader = struct {
         return self.decompressChunk(compressed_bytes);
     }
 
+    /// the returned slice aliases self.chunk_buf (only valid until the next decompressChunk or deinit)
     fn decompressChunk(self: *Self, compressed: []const u8) ![]const u8 {
         self.chunk_buf.clearRetainingCapacity();
-        var aw = std.Io.Writer.Allocating.init(self.gpa);
+        var aw = std.Io.Writer.Allocating.fromArrayList(self.gpa, &self.chunk_buf);
         defer self.chunk_buf = aw.toArrayList();
         var in = std.Io.Reader.fixed(compressed);
         var decompress = std.compress.flate.Decompress.init(&in, .zlib, &.{});

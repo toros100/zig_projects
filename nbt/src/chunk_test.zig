@@ -11,7 +11,7 @@ const Status = enum {
         reader: *nbt.PayloadReader(.string), // Tag.string here determines the interpretation of Status as NBT data
         _: std.mem.Allocator,
     ) nbt.ParseError!void {
-        dst.* = if (std.mem.eql(u8, reader.get(), "minecraft:full")) .full else .other;
+        dst.* = if (std.mem.eql(u8, reader.value, "minecraft:full")) .full else .other;
     }
 };
 
@@ -50,11 +50,7 @@ const BlockStates = struct {
         // bits required to index into palette
         const bit_width: usize = @max(4, std.math.log2_int_ceil(usize, self.palette.len));
 
-        const expected_len = std.math.divCeil(
-            usize,
-            4096,
-            (64 / bit_width),
-        ) catch unreachable;
+        const expected_len: usize = @divCeil(4096, (64 / bit_width));
 
         if (self.data.len != expected_len) return error.InvalidValue;
     }

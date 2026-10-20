@@ -1,11 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const runtime_safety = switch (builtin.mode) {
-    .Debug, .ReleaseSafe => true,
-    .ReleaseFast, .ReleaseSmall => false,
-};
-
 const Diag = struct {
     const Self = @This();
     message: []const u8,
@@ -44,35 +39,24 @@ pub fn ComptimeResult(comptime T: type) type {
             }
         }
 
-        pub inline fn unwrap(comptime self: Self) T {
+        pub fn unwrap(comptime self: Self) T {
             switch (self) {
                 .ok => |inner| return inner,
                 .err => |e| @compileError(e.msg()),
             }
         }
 
-        pub fn unwrapErr(comptime self: Self) []const u8 {
-            switch (self.inner) {
-                .ok => @compileError("unwrapped variant was not err"),
-                .err => |e| return e,
-            }
-        }
-
-        pub inline fn isOk(comptime self: Self) bool {
+        pub fn isOk(comptime self: Self) bool {
             return comptime (self == .ok);
         }
 
         pub fn isErr(comptime self: Self) bool {
             return (self == .err);
         }
-
-        pub fn asErr(comptime self: Self) ?[]const u8 {
-            return if (self == .err) self.err else null;
-        }
     };
 }
 
-pub inline fn isContainer(comptime T: type) bool {
+pub fn isContainer(comptime T: type) bool {
     return switch (@typeInfo(T)) {
         .@"struct", .@"enum", .@"union", .@"opaque" => true,
         else => false,
@@ -80,14 +64,14 @@ pub inline fn isContainer(comptime T: type) bool {
 }
 
 fn DeclType(comptime T: type, comptime name: []const u8) type {
-    if (comptime isContainer(T) and @hasDecl(T, name)) {
+    if (isContainer(T) and @hasDecl(T, name)) {
         return @TypeOf(@field(T, name));
     } else {
         return void;
     }
 }
 
-pub inline fn getFn(comptime T: type, comptime name: []const u8) ?DeclType(T, name) {
+pub fn getFn(comptime T: type, comptime name: []const u8) ?DeclType(T, name) {
     if (comptime !std.meta.hasFn(T, name)) return null;
     return @field(T, name);
 }
@@ -125,7 +109,7 @@ test "getFn" {
 
 pub fn getConst(comptime T: type, comptime name: []const u8) ?DeclType(T, name) {
     if (comptime !(isContainer(T) and @hasDecl(T, name))) return null;
-    if (comptime !@typeInfo(@TypeOf(&@field(T, name))).pointer.is_const) return null;
+    if (comptime !@typeInfo(@TypeOf(&@field(T, name))).pointer.attrs.@"const") return null;
     return @field(T, name);
 }
 
@@ -136,16 +120,19 @@ test "getConst" {
         pub const some_const: usize = 8;
         pub var some_var: usize = 0;
 
+        const non_pub_const: i8 = -3;
+
         field: usize,
     };
 
     try t.expect(getConst(S, "some_const") == 8);
     try t.expect(getConst(S, "some_var") == null);
     try t.expect(getConst(S, "field") == null);
+    try t.expect(getConst(S, "non_pub_const") == null);
 }
 
 pub inline fn unreachableFmt(comptime fmt: []const u8, args: anytype) noreturn {
-    if (runtime_safety) {
+    if (builtin.mode.runtimeSafety()) {
         std.debug.panic(fmt, args);
     } else {
         unreachable;
